@@ -19,8 +19,8 @@
 static const char *TAG = "oled";
 
 #define I2C_PORT  I2C_NUM_0
-#define SDA_PIN   21
-#define SCL_PIN   22
+#define SDA_PIN   0
+#define SCL_PIN   1
 
 #define OLED_ADDR 0x3C
 
