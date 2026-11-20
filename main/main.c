@@ -1,6 +1,10 @@
+/*
+ * Firmware Main Control CAKSA GEN-5.
+ * Log normal hanya menampilkan command yang berhasil dikirim ke LoRa.
+ * Perintah 1x/2x dihitung setelah pedal dilepas; format paket tetap 3 byte.
+ */
 #include <stdbool.h>
 #include <stdint.h>
-#include <stdio.h>
 
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
@@ -20,8 +24,8 @@
 
 static const char *TAG = "MAINCTRL";
 
-#define PEDAL_LEFT_PIN     21
-#define PEDAL_RIGHT_PIN    20
+#define PEDAL_LEFT_PIN     20
+#define PEDAL_RIGHT_PIN    21
 #define PEDAL_ACTIVE_LEVEL LOW
 
 #define PIN_LORA_MOSI      6
@@ -38,8 +42,8 @@ static const char *TAG = "MAINCTRL";
 
 #define PEDAL_POLL_MS      5
 #define PEDAL_DEBOUNCE_N   3
-#define PEDAL_CHORD_MS     60
-#define PEDAL_TAP_GAP_MS   150
+#define PEDAL_CHORD_MS     180  
+#define PEDAL_TAP_GAP_MS   500
 
 #define CMD_BURST_CYCLES   3
 #define CMD_ZERO_CYCLES    1
@@ -51,7 +55,13 @@ static const char *TAG = "MAINCTRL";
 #define PKT_LEN 3
 _Static_assert(PKT_LEN == 3, "paket harus 3 byte");
 
-enum { NODE_MAIN = 1, NODE_PANTRY, NODE_ICE, NODE_OVEN, NODE_DRONE };
+enum {
+    NODE_MAIN   = 1,
+    NODE_PANTRY = 2,
+    NODE_ICE    = 3,
+    NODE_OVEN   = 4,
+    NODE_DRONE  = 5
+};
 
 static const uint8_t s_node_id = NODE_MAIN;
 static uint32_t      s_hop_ms  = 5;
@@ -74,13 +84,26 @@ enum {
 static const char *cmd_name(uint8_t c)
 {
     switch (c) {
-    case CMD_MAIN1:    return "MAIN1";
-    case CMD_MAIN2:    return "MAIN2";
-    case CMD_OPT1:     return "OPT1";
-    case CMD_OPT2:     return "OPT2";
-    case CMD_SW_DRONE: return "SW-DRONE";
-    case CMD_SW_CAM:   return "SW-CAM";
+    case CMD_MAIN1:    return "PICK/DROP G/BALL";
+    case CMD_MAIN2:    return "PICK/DROP R/CUBE";
+    case CMD_OPT1:     return "PICK ONE BALL";
+    case CMD_OPT2:     return "PICK ONE CUBE";
+    case CMD_SW_DRONE: return "SWITCH DRONE";
+    case CMD_SW_CAM:   return "SWITCH CAM";
     default:           return "-";
+    }
+}
+
+static const char *cmd_description(uint8_t cmd)
+{
+    switch (cmd) {
+    case CMD_MAIN1:    return "PICK ONE GREEN / PICK ALL BALL / DROP ONE GREEN-BALL";
+    case CMD_MAIN2:    return "PICK ONE RED / PICK ALL CUBE / DROP ONE RED-CUBE";
+    case CMD_OPT1:     return "PICK ONE BALL";
+    case CMD_OPT2:     return "PICK ONE CUBE";
+    case CMD_SW_DRONE: return "SWITCH DRONE (PPM belum aktif)";
+    case CMD_SW_CAM:   return "SWITCH CAM (PPM belum aktif)";
+    default:           return "TIDAK ADA PERINTAH";
     }
 }
 
@@ -107,62 +130,14 @@ static void gesture_emit(uint8_t mask, uint8_t n);
 typedef struct {
     bool     down[2];
     uint8_t  cnt[2];
-    int8_t   pend;
-    uint32_t pend_t;
+    bool     press_active;
+    bool     press_invalid;
+    uint8_t  press_mask;
+    uint32_t press_started_ms;
     uint8_t  seq_mask;
     uint8_t  seq_n;
-    uint32_t last_edge;
+    uint32_t seq_released_ms;
 } gesture_t;
-
-static void gesture_tap(gesture_t *g, uint8_t mask)
-{
-    if (g->seq_n && g->seq_mask != mask) {
-        gesture_emit(g->seq_mask, g->seq_n);
-        g->seq_n = 0;
-    }
-    g->seq_mask = mask;
-    if (++g->seq_n >= 2) {
-        gesture_emit(mask, 2);
-        g->seq_n = 0;
-    }
-}
-
-static void gesture_step(gesture_t *g, uint32_t now, const bool raw[2])
-{
-
-    if (g->pend >= 0 && (now - g->pend_t) > PEDAL_CHORD_MS) {
-        gesture_tap(g, (uint8_t)(1u << g->pend));
-        g->pend = -1;
-    }
-
-    for (int i = 0; i < 2; i++) {
-        if (raw[i] == g->down[i]) {
-            g->cnt[i] = 0;
-            continue;
-        }
-        if (++g->cnt[i] < PEDAL_DEBOUNCE_N) {
-            continue;
-        }
-        g->down[i] = raw[i];
-        g->cnt[i] = 0;
-        g->last_edge = now;
-        if (!raw[i]) {
-            continue;
-        }
-        if (g->pend < 0) {
-            g->pend = (int8_t)i;
-            g->pend_t = now;
-        } else if (g->pend != i) {
-            gesture_tap(g, 0x03);
-            g->pend = -1;
-        }
-    }
-
-    if (g->seq_n && g->pend < 0 && (now - g->last_edge) >= PEDAL_TAP_GAP_MS) {
-        gesture_emit(g->seq_mask, g->seq_n);
-        g->seq_n = 0;
-    }
-}
 
 static void gesture_emit(uint8_t mask, uint8_t n)
 {
@@ -174,8 +149,86 @@ static void gesture_emit(uint8_t mask, uint8_t n)
     else if (mask == 0x03 && n == 2) cmd = CMD_SW_DRONE;
     else if (mask == 0x03 && n == 1) cmd = CMD_SW_CAM;
 
-    if (cmd != CMD_NONE) {
-        xQueueSend(s_cmd_q, &cmd, 0);
+    if (cmd != CMD_NONE && xQueueSend(s_cmd_q, &cmd, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "Antrean perintah penuh, CMD 0x%02X tidak tersimpan", (unsigned)cmd);
+    }
+}
+
+static void gesture_finish_tap(gesture_t *g, uint32_t now)
+{
+    const uint8_t mask = g->press_mask;
+    const uint32_t started_ms = g->press_started_ms;
+    const bool valid = !g->press_invalid;
+
+    g->press_active = false;
+    g->press_invalid = false;
+    g->press_mask = 0;
+
+    if (!valid) {
+        return;
+    }
+
+    if (g->seq_n) {
+        const bool in_gap = (uint32_t)(started_ms - g->seq_released_ms) <= PEDAL_TAP_GAP_MS;
+        if (in_gap && g->seq_mask == mask) {
+            gesture_emit(mask, 2);
+            g->seq_n = 0;
+            return;
+        }
+
+        gesture_emit(g->seq_mask, 1);
+        g->seq_n = 0;
+    }
+
+    g->seq_mask = mask;
+    g->seq_n = 1;
+    g->seq_released_ms = now;
+}
+
+static void gesture_step(gesture_t *g, uint32_t now, const bool raw[2])
+{
+    for (int i = 0; i < 2; i++) {
+        if (raw[i] == g->down[i]) {
+            g->cnt[i] = 0;
+            continue;
+        }
+        if (++g->cnt[i] < PEDAL_DEBOUNCE_N) {
+            continue;
+        }
+        g->down[i] = raw[i];
+        g->cnt[i] = 0;
+
+        if (raw[i]) {
+            if (!g->press_active) {
+                if (g->seq_n &&
+                    (uint32_t)(now - g->seq_released_ms) > PEDAL_TAP_GAP_MS) {
+                    gesture_emit(g->seq_mask, 1);
+                    g->seq_n = 0;
+                }
+                g->press_active = true;
+                g->press_invalid = false;
+                g->press_mask = (uint8_t)(1u << i);
+                g->press_started_ms = now;
+            } else if (g->press_mask != 0x03) {
+                const uint8_t other = (uint8_t)(1u << (1 - i));
+                if ((g->press_mask & other) && g->down[1 - i] &&
+                    (uint32_t)(now - g->press_started_ms) <= PEDAL_CHORD_MS) {
+                    g->press_mask = 0x03;
+                } else {
+                    g->press_invalid = true;
+                }
+            }
+        }
+    }
+
+    if (g->press_active && !g->down[0] && !g->down[1]) {
+        gesture_finish_tap(g, now);
+    }
+
+    if (!g->press_active && g->seq_n &&
+        (uint32_t)(now - g->seq_released_ms) >= PEDAL_TAP_GAP_MS) {
+        gesture_emit(g->seq_mask, 1);
+        g->seq_n = 0;
     }
 }
 
@@ -187,7 +240,7 @@ static void pedal_task(void *arg)
         ESP_ERROR_CHECK(pinMode(pins[i], INPUT_PULLUP));
     }
 
-    gesture_t g = { .pend = -1 };
+    gesture_t g = {0};
     TickType_t wake = xTaskGetTickCount();
     for (;;) {
         vTaskDelayUntil(&wake, pdMS_TO_TICKS(PEDAL_POLL_MS));
@@ -204,6 +257,7 @@ static SemaphoreHandle_t s_tx_mtx;
 static uint32_t          s_cycle;
 static int64_t           s_last_tx_us;
 static uint8_t           s_burst_cmd, s_burst_left, s_zero_left;
+static bool              s_cmd_logged;
 static TaskHandle_t      s_ring_task;
 
 static uint8_t cmd_next(void)
@@ -221,6 +275,7 @@ static uint8_t cmd_next(void)
     uint8_t ev;
     if (xQueueReceive(s_cmd_q, &ev, 0) == pdTRUE) {
         s_burst_cmd = ev;
+        s_cmd_logged = false;
         s_burst_left = CMD_BURST_CYCLES - 1;
         if (s_burst_left == 0) {
             s_zero_left = CMD_ZERO_CYCLES;
@@ -239,7 +294,13 @@ static void ring_broadcast_locked(void)
     const uint8_t pkt[PKT_LEN] = { s_node_id, (uint8_t)(cmd << 4), 0x00 };
 
     int64_t t = esp_timer_get_time();
-    (void)lora_send(s_radio, pkt, PKT_LEN, 0);
+    esp_err_t err = lora_send(s_radio, pkt, PKT_LEN, 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Gagal kirim LoRa: %s", esp_err_to_name(err));
+    } else if (cmd != CMD_NONE && !s_cmd_logged) {
+        ESP_LOGI(TAG, "KIRIM CMD 0x%02X: %s", (unsigned)cmd, cmd_description(cmd));
+        s_cmd_logged = true;
+    }
     s_cycle++;
 
     portENTER_CRITICAL(&s_mux);
@@ -351,22 +412,6 @@ static esp_err_t radio_init(void)
         return err;
     }
 
-    ESP_LOGI(TAG, "simbol %.1f us (PDF 128.0), airtime %lu ms (PDF 3)",
-             lora_get_symbol_time_us(s_radio),
-             (unsigned long)lora_get_airtime_ms(s_radio, PKT_LEN));
-
-    const uint8_t r31 = lora_read_reg(s_radio, 0x31), r37 = lora_read_reg(s_radio, 0x37);
-    const uint8_t r36 = lora_read_reg(s_radio, 0x36), r3a = lora_read_reg(s_radio, 0x3A);
-#if LORA_FREQ_HZ <= 525000000UL
-    const bool regs_ok = ((r31 & 0x07) == 0x05) && r37 == 0x0C && r36 == 0x02 && r3a == 0x7F;
-#else
-    const bool regs_ok = ((r31 & 0x07) == 0x05) && r37 == 0x0C && r36 == 0x02;
-#endif
-    if (regs_ok) {
-        ESP_LOGI(TAG, "register SF6/BW500 OK (0x31=%02X 0x37=%02X 0x36=%02X 0x3A=%02X)", r31, r37, r36, r3a);
-    } else {
-        ESP_LOGW(TAG, "register SF6/BW500 TIDAK sesuai: 0x31=%02X 0x37=%02X 0x36=%02X 0x3A=%02X", r31, r37, r36, r3a);
-    }
     return ESP_OK;
 }
 
@@ -389,7 +434,7 @@ static void oled_bus_check(void)
         pinMode(OLED_SDA_PIN, INPUT_PULLUP);
         pinMode(OLED_SCL_PIN, INPUT_PULLUP);
         delay(5);
-        ESP_LOGI(TAG, "I2C pemulihan bus: SDA kini %d", digitalRead(OLED_SDA_PIN));
+        ESP_LOGD(TAG, "I2C pemulihan bus: SDA kini %d", digitalRead(OLED_SDA_PIN));
     }
 
     const int sda_pu = digitalRead(OLED_SDA_PIN);
@@ -404,7 +449,7 @@ static void oled_bus_check(void)
     pinMode(OLED_SDA_PIN, INPUT_PULLUP);
     pinMode(OLED_SCL_PIN, INPUT_PULLUP);
 
-    ESP_LOGI(TAG, "I2C diam: pull-up SDA=%d SCL=%d | pull-down SDA=%d SCL=%d (normal: 1 1 | 1 1)",
+    ESP_LOGD(TAG, "I2C diam: pull-up SDA=%d SCL=%d | pull-down SDA=%d SCL=%d (normal: 1 1 | 1 1)",
              sda_pu, scl_pu, sda_pd, scl_pd);
 
     if (!sda_pu || !scl_pu) {
@@ -414,7 +459,7 @@ static void oled_bus_check(void)
         ESP_LOGW(TAG, "I2C: tidak ada pull-up eksternal di jalur %s%s, tambahkan 4.7k ke 3V3",
                  sda_pd ? "" : "SDA ", scl_pd ? "" : "SCL");
     } else {
-        ESP_LOGI(TAG, "I2C: pull-up eksternal terdeteksi di SDA dan SCL");
+        ESP_LOGD(TAG, "I2C: pull-up eksternal terdeteksi di SDA dan SCL");
     }
 }
 
@@ -441,6 +486,9 @@ static void display_task(void *arg)
 
 void app_main(void)
 {
+    esp_log_level_set("lora", ESP_LOG_WARN);
+    esp_log_level_set("oled", ESP_LOG_WARN);
+
     s_cmd_q = xQueueCreate(4, sizeof(uint8_t));
     s_tx_mtx = xSemaphoreCreateMutex();
     configASSERT(s_cmd_q && s_tx_mtx);
@@ -453,9 +501,6 @@ void app_main(void)
 
     ESP_ERROR_CHECK(radio_init());
     ESP_ERROR_CHECK(lora_start_receive(s_radio, on_rx, NULL));
-    ESP_LOGI(TAG, "node %u, hop %lu ms, timeout %lu ms", s_node_id,
-             (unsigned long)s_hop_ms, (unsigned long)ring_timeout_ms());
-
     xTaskCreate(pedal_task,   "pedal",   3072, NULL, 4,  NULL);
     xTaskCreate(display_task, "display", 3072, NULL, 2,  NULL);
     xTaskCreate(ring_task,    "ring",    3072, NULL, 10, &s_ring_task);
