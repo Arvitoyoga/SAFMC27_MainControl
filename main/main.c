@@ -9,6 +9,9 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "driver/rmt_tx.h"
+#include "driver/rmt_encoder.h"
+#include "hal/rmt_types.h"
 
 #include "easy_gpio.h"
 #include "lora.h"
@@ -34,6 +37,16 @@ static const char *TAG = "MAINCTRL";
 #define OLED_SDA_PIN       0
 #define OLED_SCL_PIN       1
 
+#define PIN_PPM_OUT       2
+#define PPM_RESOLUTION_HZ  1000000        
+#define PPM_FRAME_US       22500          
+#define PPM_PULSE_US       300             
+#define PPM_PULSE_LEVEL    0               
+#define PPM_IDLE_LEVEL     (!PPM_PULSE_LEVEL)
+#define PPM_BUF_COUNT 3
+uint16_t PPM_S_Drone     = 1000;
+uint16_t PPM_S_Cam       = 1000;
+
 #define BUZZER_PIN         8
 #define BUZZER_ACTIVE_LEVEL HIGH
 #define BUZZER_BEEP_MS     55
@@ -43,8 +56,8 @@ static const char *TAG = "MAINCTRL";
 
 #define PEDAL_POLL_MS      5
 #define PEDAL_DEBOUNCE_N   3
-#define PEDAL_CHORD_MS     180
-#define PEDAL_TAP_GAP_MS   500
+#define PEDAL_CHORD_MS     220
+#define PEDAL_TAP_GAP_MS   700
 
 #define CMD_BURST_CYCLES   3
 #define CMD_ZERO_CYCLES    1
@@ -194,6 +207,9 @@ static void gesture_emit(uint8_t mask, uint8_t n)
         ESP_LOGW(TAG, "Antrean perintah penuh, CMD 0x%02X tidak tersimpan", (unsigned)cmd);
         return;
     }
+
+    if (cmd == CMD_SW_CAM) PPM_S_Cam = (PPM_S_Cam == 2000) ? 1000 : 2000;
+    if (cmd == CMD_SW_DRONE)   PPM_S_Drone   = (PPM_S_Drone   == 1000) ? 1500 : (PPM_S_Drone == 1500) ? 2000 : 1000;
 
     buzzer_event_t bunyi = BUZZER_EVENT_CMD;
     if (cmd == CMD_SW_DRONE) bunyi = BUZZER_EVENT_SWITCH_DRONE;
@@ -346,6 +362,7 @@ static void ring_broadcast_locked(void)
         ESP_LOGE(TAG, "Gagal kirim LoRa: %s", esp_err_to_name(err));
     } else if (cmd != CMD_NONE && !s_cmd_logged) {
         ESP_LOGI(TAG, "KIRIM CMD 0x%02X: %s", (unsigned)cmd, cmd_name(cmd));
+        ESP_LOGI(TAG, "PPM VALUE: %d, %d", PPM_S_Drone, PPM_S_Cam);
         s_cmd_logged = true;
     }
     s_cycle++;
@@ -452,6 +469,7 @@ static esp_err_t radio_init(void)
     cfg.header_mode = LORA_HEADER_IMPLICIT;
     cfg.implicit_payload_len = PKT_LEN;
     cfg.ldro = LORA_LDRO_OFF;
+    cfg.tx_power_mw = 9;
 
     esp_err_t err = lora_begin(&cfg, &s_radio);
     if (err != ESP_OK) {
@@ -484,6 +502,60 @@ static void display_task(void *arg)
     }
 }
 
+static inline int ppmClamp(int v) {
+    if (v < 1000) return 1000;
+    if (v > 2000) return 2000;
+    return v;
+}
+
+static void ppmOut(void *arg) {
+    rmt_channel_handle_t tx_chan = NULL;
+    rmt_encoder_handle_t enc = NULL;
+
+    rmt_tx_channel_config_t tx_cfg = {
+        .gpio_num = PIN_PPM_OUT,
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .resolution_hz = PPM_RESOLUTION_HZ,
+        .mem_block_symbols = SOC_RMT_MEM_WORDS_PER_CHANNEL,
+        .trans_queue_depth = 2,
+        .flags.init_level = PPM_IDLE_LEVEL,
+    };
+    ESP_ERROR_CHECK(rmt_new_tx_channel(&tx_cfg, &tx_chan));
+
+    rmt_copy_encoder_config_t enc_cfg = {};
+    ESP_ERROR_CHECK(rmt_new_copy_encoder(&enc_cfg, &enc));
+    ESP_ERROR_CHECK(rmt_enable(tx_chan));
+
+    rmt_transmit_config_t trans_cfg = {
+        .loop_count = 0,
+        .flags.eot_level = PPM_IDLE_LEVEL,
+    };
+
+    static rmt_symbol_word_t sym[PPM_BUF_COUNT][3];
+    int b = 0;
+
+    while (1) {
+        int ch[2] = { ppmClamp(PPM_S_Drone), ppmClamp(PPM_S_Cam) };
+        int total = 0;
+
+        for (int i = 0; i < 2; i++) {
+            sym[b][i].level0    = PPM_PULSE_LEVEL;
+            sym[b][i].duration0 = PPM_PULSE_US;
+            sym[b][i].level1    = PPM_IDLE_LEVEL;
+            sym[b][i].duration1 = ch[i] - PPM_PULSE_US;
+            total += ch[i];
+        }
+        sym[b][2].level0    = PPM_PULSE_LEVEL;
+        sym[b][2].duration0 = PPM_PULSE_US;
+        sym[b][2].level1    = PPM_IDLE_LEVEL;
+        sym[b][2].duration1 = PPM_FRAME_US - total - PPM_PULSE_US;
+
+        // blok otomatis kalau antrean penuh, tanpa wait_all_done
+        ESP_ERROR_CHECK(rmt_transmit(tx_chan, enc, sym[b], sizeof(sym[b]), &trans_cfg));
+        b = (b + 1) % PPM_BUF_COUNT;
+    }
+}
+
 void app_main(void)
 {
     esp_log_level_set("lora", ESP_LOG_WARN);
@@ -509,4 +581,5 @@ void app_main(void)
     xTaskCreate(pedal_task,   "pedal",   3072, NULL, 4,  NULL);
     xTaskCreate(display_task, "display", 3072, NULL, 2,  NULL);
     xTaskCreate(ring_task,    "ring",    3072, NULL, 10, &s_ring_task);
+    xTaskCreate(ppmOut, "ppmOut", 3072, NULL, 5, NULL);
 }
