@@ -37,13 +37,14 @@ static const char *TAG = "MAINCTRL";
 #define OLED_SDA_PIN       0
 #define OLED_SCL_PIN       1
 
-#define PIN_PPM_OUT       2
-#define PPM_RESOLUTION_HZ  1000000        
-#define PPM_FRAME_US       22500          
-#define PPM_PULSE_US       300             
-#define PPM_PULSE_LEVEL    0               
-#define PPM_IDLE_LEVEL     (!PPM_PULSE_LEVEL)
-#define PPM_BUF_COUNT 3
+#define PIN_PPM_OUT        GPIO_NUM_2
+#define PPM_RESOLUTION_HZ  1000000         
+#define PPM_FRAME_US       22500
+#define PPM_PULSE_US       300
+#define PPM_PULSE_LEVEL    1             
+#define PPM_IDLE_LEVEL     0
+#define PPM_CH_NUM         8
+
 uint16_t PPM_S_Drone     = 1000;
 uint16_t PPM_S_Cam       = 1000;
 
@@ -56,8 +57,8 @@ uint16_t PPM_S_Cam       = 1000;
 
 #define PEDAL_POLL_MS      5
 #define PEDAL_DEBOUNCE_N   3
-#define PEDAL_CHORD_MS     220
-#define PEDAL_TAP_GAP_MS   700
+#define PEDAL_CHORD_MS     300
+#define PEDAL_TAP_GAP_MS   400
 
 #define CMD_BURST_CYCLES   3
 #define CMD_ZERO_CYCLES    1
@@ -517,7 +518,7 @@ static void ppmOut(void *arg) {
         .clk_src = RMT_CLK_SRC_DEFAULT,
         .resolution_hz = PPM_RESOLUTION_HZ,
         .mem_block_symbols = SOC_RMT_MEM_WORDS_PER_CHANNEL,
-        .trans_queue_depth = 2,
+        .trans_queue_depth = 4,
         .flags.init_level = PPM_IDLE_LEVEL,
     };
     ESP_ERROR_CHECK(rmt_new_tx_channel(&tx_cfg, &tx_chan));
@@ -531,28 +532,28 @@ static void ppmOut(void *arg) {
         .flags.eot_level = PPM_IDLE_LEVEL,
     };
 
-    static rmt_symbol_word_t sym[PPM_BUF_COUNT][3];
-    int b = 0;
+    rmt_symbol_word_t sym[PPM_CH_NUM + 1];   
 
     while (1) {
-        int ch[2] = { ppmClamp(PPM_S_Drone), ppmClamp(PPM_S_Cam) };
+        int ch[PPM_CH_NUM] = { ppmClamp(PPM_S_Drone), ppmClamp(PPM_S_Cam),
+                               1500, 1500, 1500, 1500, 1500, 1500 };
         int total = 0;
 
-        for (int i = 0; i < 2; i++) {
-            sym[b][i].level0    = PPM_PULSE_LEVEL;
-            sym[b][i].duration0 = PPM_PULSE_US;
-            sym[b][i].level1    = PPM_IDLE_LEVEL;
-            sym[b][i].duration1 = ch[i] - PPM_PULSE_US;
+        for (int i = 0; i < PPM_CH_NUM; i++) {
+            sym[i].level0    = PPM_PULSE_LEVEL;
+            sym[i].duration0 = PPM_PULSE_US;
+            sym[i].level1    = PPM_IDLE_LEVEL;
+            sym[i].duration1 = ch[i] - PPM_PULSE_US;
             total += ch[i];
         }
-        sym[b][2].level0    = PPM_PULSE_LEVEL;
-        sym[b][2].duration0 = PPM_PULSE_US;
-        sym[b][2].level1    = PPM_IDLE_LEVEL;
-        sym[b][2].duration1 = PPM_FRAME_US - total - PPM_PULSE_US;
 
-        // blok otomatis kalau antrean penuh, tanpa wait_all_done
-        ESP_ERROR_CHECK(rmt_transmit(tx_chan, enc, sym[b], sizeof(sym[b]), &trans_cfg));
-        b = (b + 1) % PPM_BUF_COUNT;
+        sym[PPM_CH_NUM].level0    = PPM_PULSE_LEVEL;
+        sym[PPM_CH_NUM].duration0 = PPM_PULSE_US;
+        sym[PPM_CH_NUM].level1    = PPM_IDLE_LEVEL;
+        sym[PPM_CH_NUM].duration1 = PPM_FRAME_US - total - PPM_PULSE_US;
+
+        ESP_ERROR_CHECK(rmt_transmit(tx_chan, enc, sym, sizeof(sym), &trans_cfg));
+        ESP_ERROR_CHECK(rmt_tx_wait_all_done(tx_chan, portMAX_DELAY));
     }
 }
 
