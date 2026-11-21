@@ -19,13 +19,19 @@
       "inheritDefault": "hidden"
     }
   },
-  "clangd.path": "/home/arvito/.espressif/tools/esp-clang/esp-20.1.1_20250829/esp-clang/bin/clangd",
+  "clangd.path": "/home/areal/.espressif/tools/esp-clangd/esp-21.1.3_20260408/esp-clangd/bin/clangd",
   "clangd.arguments": [
     "--background-index",
     "--query-driver=**",
-    "--compile-commands-dir=/home/arvito/Documents/Codes/SAFMC27_MainControl/build"
+    "--compile-commands-dir=/home/areal/Caksa/safmc-2027/SAFMC27_MainControl/build"
   ],
-  "idf.currentSetup": "/home/arvito/.espressif/v6.0.2/esp-idf",
-  "idf.port": "/dev/ttyUSB0",
-  "idf.flashType": "UART"
+  "idf.currentSetup": "/home/areal/.espressif/v6.1/esp-idf",
+  "idf.port": "/dev/ttyACM0",
+  "idf.flashType": "UART",
+  "idf.openOcdConfigs": [
+    "board/esp32c3-builtin.cfg"
+  ],
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32c3"
+  }
 }
