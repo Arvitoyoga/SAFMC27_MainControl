@@ -1,10 +1,6 @@
-/*
- * Firmware Main Control CAKSA GEN-5.
- * Log normal hanya menampilkan command yang berhasil dikirim ke LoRa.
- * Perintah 1x/2x dihitung setelah pedal dilepas; format paket tetap 3 byte.
- */
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
@@ -38,11 +34,16 @@ static const char *TAG = "MAINCTRL";
 #define OLED_SDA_PIN       0
 #define OLED_SCL_PIN       1
 
+#define BUZZER_PIN         8
+#define BUZZER_ACTIVE_LEVEL HIGH
+#define BUZZER_BEEP_MS     55
+#define BUZZER_GAP_MS      90
+
 #define LORA_FREQ_HZ       433000000
 
 #define PEDAL_POLL_MS      5
 #define PEDAL_DEBOUNCE_N   3
-#define PEDAL_CHORD_MS     180  
+#define PEDAL_CHORD_MS     180
 #define PEDAL_TAP_GAP_MS   500
 
 #define CMD_BURST_CYCLES   3
@@ -94,19 +95,6 @@ static const char *cmd_name(uint8_t c)
     }
 }
 
-static const char *cmd_description(uint8_t cmd)
-{
-    switch (cmd) {
-    case CMD_MAIN1:    return "PICK ONE GREEN / PICK ALL BALL / DROP ONE GREEN-BALL";
-    case CMD_MAIN2:    return "PICK ONE RED / PICK ALL CUBE / DROP ONE RED-CUBE";
-    case CMD_OPT1:     return "PICK ONE BALL";
-    case CMD_OPT2:     return "PICK ONE CUBE";
-    case CMD_SW_DRONE: return "SWITCH DRONE (PPM belum aktif)";
-    case CMD_SW_CAM:   return "SWITCH CAM (PPM belum aktif)";
-    default:           return "TIDAK ADA PERINTAH";
-    }
-}
-
 typedef struct {
     uint8_t  red, green, pantry_land;
     uint8_t  ball, ice_land;
@@ -124,6 +112,57 @@ static ring_state_t s_st = { .link_ok = false };
 static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static QueueHandle_t s_cmd_q;
+static QueueHandle_t s_buzzer_q;
+
+typedef enum {
+    BUZZER_EVENT_CMD = 1,
+    BUZZER_EVENT_SWITCH_DRONE,
+    BUZZER_EVENT_SWITCH_CAM
+} buzzer_event_t;
+
+typedef struct {
+    uint16_t hidup_ms;
+    uint16_t jeda_ms;
+} buzzer_step_t;
+
+static const buzzer_step_t s_startup_pattern[] = {
+    {110, 70}, {110, 90}, {170, 70}, {80, 55},
+    {80, 80}, {150, 65}, {220, 0}
+};
+
+static void buzzer_play_step(uint32_t hidup_ms, uint32_t jeda_ms)
+{
+    digitalWrite(BUZZER_PIN, BUZZER_ACTIVE_LEVEL);
+    vTaskDelay(pdMS_TO_TICKS(hidup_ms));
+    digitalWrite(BUZZER_PIN, !BUZZER_ACTIVE_LEVEL);
+    if (jeda_ms > 0) {
+        vTaskDelay(pdMS_TO_TICKS(jeda_ms));
+    }
+}
+
+static void buzzer_task(void *arg)
+{
+    (void)arg;
+
+    for (size_t i = 0; i < sizeof(s_startup_pattern) / sizeof(s_startup_pattern[0]); i++) {
+        buzzer_play_step(s_startup_pattern[i].hidup_ms, s_startup_pattern[i].jeda_ms);
+    }
+
+    for (;;) {
+        buzzer_event_t event;
+        if (xQueueReceive(s_buzzer_q, &event, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        int jumlah_beep = 1;
+        if (event == BUZZER_EVENT_SWITCH_DRONE) jumlah_beep = 2;
+        else if (event == BUZZER_EVENT_SWITCH_CAM) jumlah_beep = 3;
+
+        for (int i = 0; i < jumlah_beep; i++) {
+            buzzer_play_step(BUZZER_BEEP_MS, i + 1 < jumlah_beep ? BUZZER_GAP_MS : 0);
+        }
+    }
+}
 
 static void gesture_emit(uint8_t mask, uint8_t n);
 
@@ -149,9 +188,17 @@ static void gesture_emit(uint8_t mask, uint8_t n)
     else if (mask == 0x03 && n == 2) cmd = CMD_SW_DRONE;
     else if (mask == 0x03 && n == 1) cmd = CMD_SW_CAM;
 
-    if (cmd != CMD_NONE && xQueueSend(s_cmd_q, &cmd, 0) != pdTRUE) {
+    if (cmd == CMD_NONE) return;
+
+    if (xQueueSend(s_cmd_q, &cmd, 0) != pdTRUE) {
         ESP_LOGW(TAG, "Antrean perintah penuh, CMD 0x%02X tidak tersimpan", (unsigned)cmd);
+        return;
     }
+
+    buzzer_event_t bunyi = BUZZER_EVENT_CMD;
+    if (cmd == CMD_SW_DRONE) bunyi = BUZZER_EVENT_SWITCH_DRONE;
+    else if (cmd == CMD_SW_CAM) bunyi = BUZZER_EVENT_SWITCH_CAM;
+    (void)xQueueSend(s_buzzer_q, &bunyi, 0);
 }
 
 static void gesture_finish_tap(gesture_t *g, uint32_t now)
@@ -175,7 +222,7 @@ static void gesture_finish_tap(gesture_t *g, uint32_t now)
             g->seq_n = 0;
             return;
         }
-
+        
         gesture_emit(g->seq_mask, 1);
         g->seq_n = 0;
     }
@@ -298,7 +345,7 @@ static void ring_broadcast_locked(void)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Gagal kirim LoRa: %s", esp_err_to_name(err));
     } else if (cmd != CMD_NONE && !s_cmd_logged) {
-        ESP_LOGI(TAG, "KIRIM CMD 0x%02X: %s", (unsigned)cmd, cmd_description(cmd));
+        ESP_LOGI(TAG, "KIRIM CMD 0x%02X: %s", (unsigned)cmd, cmd_name(cmd));
         s_cmd_logged = true;
     }
     s_cycle++;
@@ -415,54 +462,6 @@ static esp_err_t radio_init(void)
     return ESP_OK;
 }
 
-static void oled_bus_check(void)
-{
-    pinMode(OLED_SDA_PIN, INPUT_PULLUP);
-    pinMode(OLED_SCL_PIN, INPUT_PULLUP);
-    delay(5);
-
-    if (digitalRead(OLED_SDA_PIN) == LOW && digitalRead(OLED_SCL_PIN) == HIGH) {
-        ESP_LOGW(TAG, "I2C: SDA tertahan LOW (OLED macet di tengah transfer), memulihkan bus");
-        pinMode(OLED_SCL_PIN, OUTPUT_OPEN_DRAIN);
-        gpio_set_pull_mode((gpio_num_t)OLED_SCL_PIN, GPIO_PULLUP_ONLY);
-        for (int i = 0; i < 9 && digitalRead(OLED_SDA_PIN) == LOW; i++) {
-            digitalWrite(OLED_SCL_PIN, LOW);
-            delayMicroseconds(10);
-            digitalWrite(OLED_SCL_PIN, HIGH);
-            delayMicroseconds(10);
-        }
-        pinMode(OLED_SDA_PIN, INPUT_PULLUP);
-        pinMode(OLED_SCL_PIN, INPUT_PULLUP);
-        delay(5);
-        ESP_LOGD(TAG, "I2C pemulihan bus: SDA kini %d", digitalRead(OLED_SDA_PIN));
-    }
-
-    const int sda_pu = digitalRead(OLED_SDA_PIN);
-    const int scl_pu = digitalRead(OLED_SCL_PIN);
-
-    pinMode(OLED_SDA_PIN, INPUT_PULLDOWN);
-    pinMode(OLED_SCL_PIN, INPUT_PULLDOWN);
-    delay(5);
-    const int sda_pd = digitalRead(OLED_SDA_PIN);
-    const int scl_pd = digitalRead(OLED_SCL_PIN);
-
-    pinMode(OLED_SDA_PIN, INPUT_PULLUP);
-    pinMode(OLED_SCL_PIN, INPUT_PULLUP);
-
-    ESP_LOGD(TAG, "I2C diam: pull-up SDA=%d SCL=%d | pull-down SDA=%d SCL=%d (normal: 1 1 | 1 1)",
-             sda_pu, scl_pu, sda_pd, scl_pd);
-
-    if (!sda_pu || !scl_pu) {
-        ESP_LOGW(TAG, "I2C: jalur %s%s masih tertahan LOW (korsleting, OLED tidak berdaya, atau urutan pin salah)",
-                 sda_pu ? "" : "SDA ", scl_pu ? "" : "SCL");
-    } else if (!sda_pd || !scl_pd) {
-        ESP_LOGW(TAG, "I2C: tidak ada pull-up eksternal di jalur %s%s, tambahkan 4.7k ke 3V3",
-                 sda_pd ? "" : "SDA ", scl_pd ? "" : "SCL");
-    } else {
-        ESP_LOGD(TAG, "I2C: pull-up eksternal terdeteksi di SDA dan SCL");
-    }
-}
-
 static void display_task(void *arg)
 {
     (void)arg;
@@ -474,11 +473,12 @@ static void display_task(void *arg)
 
         oled_printf(0, 0, "DRONE:%X LINK:%s", s.drone, s.link_ok ? "OK" : "LOST");
         oled_printf(0, 1, "CMD:%s", cmd_name(s.last_cmd));
-        oled_printf(0, 2, "PANTRY R:%X G:%X L:%X", s.red, s.green, s.pantry_land);
-        oled_printf(0, 3, "ICE    BALL:%X L:%X", s.ball, s.ice_land);
-        oled_printf(0, 4, "OVEN   CUBE:%X L:%X", s.cube, s.oven_land);
-        oled_printf(0, 5, "PAYLOAD:%03X", s.payload);
-        oled_printf(0, 6, "CYCLE:%lu US", (unsigned long)s.cycle_us);
+        oled_printf(0, 2, "----- DATA PRS -----");
+        oled_printf(0, 3, "PANTRY R:%X G:%X L:%X", s.red, s.green, s.pantry_land);
+        oled_printf(0, 4, "ICE B:%X/%X OVEN C:%X/%X",
+                    s.ball, s.ice_land, s.cube, s.oven_land);
+        oled_printf(0, 5, "----- DATA RING -----");
+        oled_printf(0, 6, "PAY:%03X CYC:%luUS", s.payload, (unsigned long)s.cycle_us);
         oled_printf(0, 7, "TIMEOUT:%lu", (unsigned long)s.timeouts);
         vTaskDelay(pdMS_TO_TICKS(100));
     }
@@ -490,10 +490,15 @@ void app_main(void)
     esp_log_level_set("oled", ESP_LOG_WARN);
 
     s_cmd_q = xQueueCreate(4, sizeof(uint8_t));
+    s_buzzer_q = xQueueCreate(8, sizeof(buzzer_event_t));
     s_tx_mtx = xSemaphoreCreateMutex();
-    configASSERT(s_cmd_q && s_tx_mtx);
+    configASSERT(s_cmd_q && s_buzzer_q && s_tx_mtx);
 
-    oled_bus_check();
+    ESP_ERROR_CHECK(pinMode(BUZZER_PIN, OUTPUT));
+    digitalWrite(BUZZER_PIN, !BUZZER_ACTIVE_LEVEL);
+    BaseType_t buzzer_ok = xTaskCreate(buzzer_task, "buzzer", 2048, NULL, 2, NULL);
+    configASSERT(buzzer_ok == pdPASS);
+
     oled_init();
     oled_clear();
     oled_printf(0, 0, "MAIN CONTROL");
